@@ -1,138 +1,84 @@
-using SparseArrays, StaticArrays
+import cupy as cp
+import numpy as np
+from numba import cuda, njit
+from scipy.sparse import csc_matrix
 
+def _assemble_full_kkt_matrix(P, A, cones, shape='triu'):
+    map = FullDataMap(P, A, cones)
+    m, n = A.shape
+    p = pdim(map.sparse_maps)
 
-function _assemble_full_kkt_matrix(
-    P::SparseMatrixCSC{T},
-    A::SparseMatrixCSC{T},
-    cones::CompositeCone{T},
-    shape::Symbol = :triu  #or tril
-) where{T}
+    nnz_diagP = _count_diagonal_entries_full(P)
+    nnz_Hsblocks = len(map.Hsblocks)
 
-    map   = FullDataMap(P,A,cones)
-    (m,n) = (size(A,1), size(P,1))
-    p     = pdim(map.sparse_maps)
+    nnzKKT = (P.nnz + n - nnz_diagP + 2 * A.nnz + nnz_Hsblocks + 2 * nnz_vec(map.sparse_maps) + p)
 
-    #entries actually on the diagonal of P
-    nnz_diagP  = _count_diagonal_entries_full(P)
+    K = csc_matrix((m + n + p, m + n + p), dtype=P.dtype)
 
-    # total entries in the Hs blocks
-    nnz_Hsblocks = length(map.Hsblocks)
+    _full_kkt_assemble_colcounts(K, P, A, cones, map)
+    _full_kkt_assemble_fill(K, P, A, cones, map)
 
-    nnzKKT = (nnz(P) +      # Number of elements in P
-    n -                     # Number of elements in diagonal top left block
-    nnz_diagP +             # remove double count on the diagonal if P has entries
-    2*nnz(A) +                # Number of nonzeros in A and A'
-    nnz_Hsblocks +          # Number of elements in diagonal below A'
-    2*nnz_vec(map.sparse_maps) + # Number of elements in sparse cone off diagonals, 2x compared to the triangle form
-    p                       # Number of elements in diagonal of sparse cones
-    )
+    return K, map
 
-    K = _csc_spalloc(T, m+n+p, m+n+p, nnzKKT)
+def _full_kkt_assemble_colcounts(K, P, A, cones, map):
+    m, n = A.shape
 
-    _full_kkt_assemble_colcounts(K,P,A,cones,map)       
-    _full_kkt_assemble_fill(K,P,A,cones,map)
+    K.indptr[:] = 0
 
-    return K,map
+    _csc_colcount_block_full(K, P, A, 1)
+    _csc_colcount_missing_diag_full(K, P, 1)
+    _csc_colcount_block(K, A, n + 1, 'T')
 
-end
+    pcol = m + n + 1
+    sparse_map_iter = iter(map.sparse_maps)
 
-function _full_kkt_assemble_colcounts(
-    K::SparseMatrixCSC{T},
-    P::SparseMatrixCSC{T},
-    A::SparseMatrixCSC{T},
-    cones,
-    map
-) where{T}
+    for i, cone in enumerate(cones):
+        row = cones.rng_cones[i][0] + n
 
-    (m,n) = size(A)
+        blockdim = cone.numel()
+        if Hs_is_diagonal(cone):
+            _csc_colcount_diag(K, row, blockdim)
+        else:
+            _csc_colcount_dense_full(K, row, blockdim)
 
-    #use K.p to hold nnz entries in each
-    #column of the KKT matrix
-    K.colptr .= 0
+        if is_sparse_expandable(cone):
+            thismap = next(sparse_map_iter)
+            _csc_colcount_sparsecone_full(cone, thismap, K, row, pcol)
+            pcol += pdim(thismap)
 
-    #Count first n columns of KKT
-    _csc_colcount_block_full(K,P,A,1)
-    _csc_colcount_missing_diag_full(K,P,1)
-    _csc_colcount_block(K,A,n+1,:T)
+    return
 
-   # track the next sparse column to fill (assuming triu fill)
-   pcol = m + n + 1 #next sparse column to fill
-   sparse_map_iter = Iterators.Stateful(map.sparse_maps)
-    
-    for (i,cone) = enumerate(cones)
-        row = first(cones.rng_cones[i]) + n
+def _full_kkt_assemble_fill(K, P, A, cones, map):
+    m, n = A.shape
 
-        #add the the Hs blocks in the lower right
-        blockdim = numel(cone)
-        if Hs_is_diagonal(cone)
-            _csc_colcount_diag(K,row,blockdim)
-        else
-            _csc_colcount_dense_full(K,row,blockdim)
-        end
-
-        #add sparse expansions columns for sparse cones 
-        if @conedispatch is_sparse_expandable(cone)  
-            thismap = popfirst!(sparse_map_iter)
-            _csc_colcount_sparsecone_full(cone,thismap,K,row,pcol)
-            pcol += pdim(thismap) #next sparse column to fill 
-        end 
-    end
-
-    return nothing
-end
-
-
-function _full_kkt_assemble_fill(
-    K::SparseMatrixCSC{T},
-    P::SparseMatrixCSC{T},
-    A::SparseMatrixCSC{T},
-    cones,
-    map
-) where{T}
-
-    (m,n) = size(A)
-
-    #cumsum total entries to convert to K.p
     _csc_colcount_to_colptr(K)
 
-    #filling [P At;A 0] parts
-    _csc_fill_P_block_with_missing_diag_full(K,P,map.P)
-    _csc_fill_block(K,A,map.A,n+1,1,:N)
-    _csc_fill_block(K,A,map.At,1,n+1,:T)
+    _csc_fill_P_block_with_missing_diag_full(K, P, map.P)
+    _csc_fill_block(K, A, map.A, n + 1, 1, 'N')
+    _csc_fill_block(K, A, map.At, 1, n + 1, 'T')
 
-    # track the next sparse column to fill (assuming full fill)
-    pcol = m + n + 1 #next sparse column to fill
-    sparse_map_iter = Iterators.Stateful(map.sparse_maps)
+    pcol = m + n + 1
+    sparse_map_iter = iter(map.sparse_maps)
 
-    for (i,cone) = enumerate(cones)
-        row = first(cones.rng_cones[i]) + n
+    for i, cone in enumerate(cones):
+        row = cones.rng_cones[i][0] + n
 
-        #add the the Hs blocks in the lower right
-        blockdim = numel(cone)
-        block    = view(map.Hsblocks,cones.rng_blocks[i])
+        blockdim = cone.numel()
+        block = map.Hsblocks[cones.rng_blocks[i]]
 
-        if Hs_is_diagonal(cone)
-            _csc_fill_diag(K,block,row,blockdim)
-        else
-            _csc_fill_dense_full(K,block,row,blockdim)
-        end
+        if Hs_is_diagonal(cone):
+            _csc_fill_diag(K, block, row, blockdim)
+        else:
+            _csc_fill_dense_full(K, block, row, blockdim)
 
-        #add sparse expansions columns for sparse cones 
-        if @conedispatch is_sparse_expandable(cone) 
-            thismap = popfirst!(sparse_map_iter)
-            _csc_fill_sparsecone_full(cone,thismap,K,row,pcol)
-            pcol += pdim(thismap) #next sparse column to fill 
-        end 
-    end
-    
-    #backshift the colptrs to recover K.p again
+        if is_sparse_expandable(cone):
+            thismap = next(sparse_map_iter)
+            _csc_fill_sparsecone_full(cone, thismap, K, row, pcol)
+            pcol += pdim(thismap)
+
     _kkt_backshift_colptrs(K)
 
-    #Now we can populate the index of the full diagonal.
-    #We have filled in structural zeros on it everywhere.
+    _map_diag_full(K, map.diag_full)
+    map.diagP[:] = map.diag_full[:n]
 
-    _map_diag_full(K,map.diag_full)
-    @views map.diagP     .= map.diag_full[1:n]
-
-    return nothing
-end
+    return

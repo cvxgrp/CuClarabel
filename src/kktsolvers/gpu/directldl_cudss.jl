@@ -1,60 +1,24 @@
-using CUDA, CUDA.CUSPARSE
-using CUDSS
+import cupy as cp
+import numpy as np
+from numba import cuda, njit
+from cudss import CudssSolver, cudss, cudss_set, ldiv
 
-export CUDSSDirectLDLSolver
-struct CUDSSDirectLDLSolver{T} <: AbstractGPUSolver{T}
+class CUDSSDirectLDLSolver:
+    def __init__(self, KKT, x, b):
+        self.KKTgpu = KKT
+        self.cudssSolver = CudssSolver(KKT, "S", 'F')
+        cudss("analysis", self.cudssSolver, x, b)
+        cudss("factorization", self.cudssSolver, x, b)
+        self.x = x
+        self.b = b
 
-    KKTgpu::AbstractSparseMatrix{T}
-    cudssSolver::CUDSS.CudssSolver{T}
-    x::AbstractVector{T}
-    b::AbstractVector{T}
-    
+def required_matrix_shape():
+    return 'full'
 
-    function CUDSSDirectLDLSolver{T}(KKT::AbstractSparseMatrix{T},x,b) where {T}
-
-        dim = LinearAlgebra.checksquare(KKT)
-
-        #make a logical factorization to fix memory allocations
-        # "S" denotes real symmetric and 'U' denotes the upper triangular
-
-        KKTgpu = KKT
-        cudssSolver = CUDSS.CudssSolver(KKTgpu, "S", 'F')
-
-        cudss("analysis", cudssSolver, x, b)
-        cudss("factorization", cudssSolver, x, b)
-
-        return new(KKTgpu,cudssSolver,x,b)
-    end
-
-end
-
-GPUSolversDict[:cudss] = CUDSSDirectLDLSolver
-required_matrix_shape(::Type{CUDSSDirectLDLSolver}) = :full
-
-#refactor the linear system
-function refactor!(ldlsolver::CUDSSDirectLDLSolver{T}) where{T}
-
-    # Update the KKT matrix in the cudss solver
-    cudss_set(ldlsolver.cudssSolver.matrix,ldlsolver.KKTgpu)
-
-    # Refactorization
+def refactor(ldlsolver):
+    cudss_set(ldlsolver.cudssSolver.matrix, ldlsolver.KKTgpu)
     cudss("factorization", ldlsolver.cudssSolver, ldlsolver.x, ldlsolver.b)
+    return True
 
-    # YC: should be corrected later on 
-    return true
-    # return all(isfinite, cudss_get(ldlsolver.cudssSolver.data,"diag"))
-
-end
-
-
-#solve the linear system
-function solve!(
-    ldlsolver::CUDSSDirectLDLSolver{T},
-    x::AbstractVector{T},
-    b::AbstractVector{T}
-) where{T}
-    
-    #solve on GPU
-    ldiv!(x,ldlsolver.cudssSolver,b)
-
-end
+def solve(ldlsolver, x, b):
+    ldiv(x, ldlsolver.cudssSolver, b)

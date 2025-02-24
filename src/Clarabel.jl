@@ -1,142 +1,143 @@
-__precompile__()
-module Clarabel
+import cupy as cp
+import numpy as np
+from numba import cuda, njit
+from scipy.sparse import csr_matrix
 
-    using SparseArrays, LinearAlgebra, Printf, Requires
-    using CUDA, CUDA.CUBLAS # for GPU implementation
-    const DefaultFloat = Float64
-    const DefaultInt   = Int64
-    const SOC_NO_EXPANSION_MAX_SIZE   = 5  # maximal size of second-order cones in GPU implementation
+DefaultFloat = np.float64
+DefaultInt = np.int64
+SOC_NO_EXPANSION_MAX_SIZE = 5  # maximal size of second-order cones in GPU implementation
 
-    # Rust-like Option type
-    const Option{T} = Union{Nothing,T} 
+# Rust-like Option type
+Option = type(None)
 
-    #internal constraint RHS limits.  This let block 
-    #hides the INFINITY field in the module and makes 
-    #it accessible only via the get/set provided
-    let 
-        _INFINITY_DEFAULT = 1e20
-        INFINITY = _INFINITY_DEFAULT
-        global default_infinity() = INFINITY = _INFINITY_DEFAULT;
-        global set_infinity(v::Float64) = INFINITY =  Float64(v)
-        global get_infinity() = INFINITY
-    end 
-    
-    #List of GPU solvers
-    gpu_solver_list = [:cudss, :cudssmixed]
-    
-    #version / release info
-    include("./version.jl")
+# Internal constraint RHS limits
+_INFINITY_DEFAULT = 1e20
+INFINITY = _INFINITY_DEFAULT
 
-    #API for user cone specifications
-    include("./cones/cone_api.jl")
+def default_infinity():
+    global INFINITY
+    INFINITY = _INFINITY_DEFAULT
 
-    #cone type definitions
-    include("./cones/cone_types.jl")
-    include("./cones/cone_dispatch.jl")
-    include("./cones/compositecone_type.jl")
-    include("./gpucones/compositecone_type_gpu.jl")
+def set_infinity(v):
+    global INFINITY
+    INFINITY = float(v)
 
-    #core solver components
-    include("./abstract_types.jl")
-    include("./settings.jl")
-    include("./statuscodes.jl")
-    include("./chordal/include.jl")
-    include("./types.jl")  
-    include("./presolver.jl")
-    include("./variables.jl")
-    include("./residuals.jl")
-    include("./problemdata.jl")
+def get_infinity():
+    return INFINITY
 
-    #direct LDL linear solve methods
-    include("./kktsolvers/direct-ldl/includes.jl")
+# List of GPU solvers
+gpu_solver_list = ['cudss', 'cudssmixed']
 
-    #KKT solvers and solver level kktsystem
-    include("./kktsolvers/kktsolver_defaults.jl")
-    include("./kktsolvers/kktsolver_directldl.jl")
+# Version / release info
+# include("./version.py")
 
-    include("./kktsystem.jl")
-    include("./kktsystem_gpu.jl")
+# API for user cone specifications
+# include("./cones/cone_api.py")
 
-    include("./info.jl")
-    include("./solution.jl")
+# Cone type definitions
+# include("./cones/cone_types.py")
+# include("./cones/cone_dispatch.py")
+# include("./cones/compositecone_type.py")
+# include("./gpucones/compositecone_type_gpu.py")
 
-    #GPU ldl methods
-    include("./kktsolvers/gpu/includes.jl")
-    include("./kktsolvers/kktsolver_directldl_gpu.jl")
+# Core solver components
+# include("./abstract_types.py")
+# include("./settings.py")
+# include("./statuscodes.py")
+# include("./chordal/include.py")
+# include("./types.py")
+# include("./presolver.py")
+# include("./variables.py")
+# include("./residuals.py")
+# include("./problemdata.py")
 
-    # printing and top level solver
-    include("./info_print.jl")
-    include("./solver.jl")
+# Direct LDL linear solve methods
+# include("./kktsolvers/direct-ldl/includes.py")
 
-    #conic constraints.  Additional
-    #cone implementations go here
-    include("./cones/coneops_defaults.jl")
-    include("./cones/coneops_zerocone.jl")
-    include("./cones/coneops_nncone.jl")
-    include("./cones/coneops_socone.jl")
-    include("./cones/coneops_psdtrianglecone.jl")
-    include("./cones/coneops_expcone.jl")
-    include("./cones/coneops_powcone.jl")
-    include("./cones/coneops_genpowcone.jl")        #Generalized power cone 
-    include("./cones/coneops_compositecone.jl")
-    include("./cones/coneops_nonsymmetric_common.jl")
-    include("./cones/coneops_symmetric_common.jl")
+# KKT solvers and solver level kktsystem
+# include("./kktsolvers/kktsolver_defaults.py")
+# include("./kktsolvers/kktsolver_directldl.py")
 
-    #GPU cone implementations
-    include("./gpucones/mathutilGPU.jl")
-    include("./gpucones/coneops_zerocone_gpu.jl")
-    include("./gpucones/coneops_nncone_gpu.jl")
-    include("./gpucones/coneops_socone_gpu.jl")
-    include("./gpucones/coneops_expcone_gpu.jl")
-    include("./gpucones/coneops_powcone_gpu.jl")
-    include("./gpucones/coneops_psdtrianglecone_gpu.jl")
-    include("./gpucones/coneops_compositecone_gpu.jl")
-    include("./gpucones/coneops_nonsymmetric_common_gpu.jl")
-    include("./gpucones/augment_socp.jl")
+# include("./kktsystem.py")
+# include("./kktsystem_gpu.py")
 
-    #various algebraic utilities
-    include("./utils/mathutils.jl")
-    include("./utils/csc_assembly.jl")
+# include("./info.py")
+# include("./solution.py")
 
-    #data updating
-    include("./data_updating.jl")
+# GPU ldl methods
+# include("./kktsolvers/gpu/includes.py")
+# include("./kktsolvers/kktsolver_directldl_gpu.py")
 
-    #optional dependencies.  
-    #NB: This __init__ function and its @require statements 
-    #should be removed upon update of this package for use 
-    #with Julia v1.10+, after which weakdeps / external 
-    #dependencies will be natively supported 
-    function __init__()
-        @require Pardiso="46dd5b70-b6fb-5a00-ae2d-e8fea33afaf2" begin
-            include("./kktsolvers/direct-ldl/directldl_pardiso.jl")  
-        end 
-        @require HSL="34c5aeac-e683-54a6-a0e9-6e0fdc586c50" begin
-            include("./kktsolvers/direct-ldl/directldl_hsl.jl")
-        end 
-    end
- 
-    # JSON I/O
-    include("./json.jl")
+# Printing and top level solver
+# include("./info_print.py")
+# include("./solver.py")
 
-    #MathOptInterface for JuMP/Convex.jl
-    module MOI  #extensions providing non-standard MOI constraint types
-        include("./MOI_wrapper/MOI_extensions.jl")
-    end
-    module MOIwrapper #our actual MOI interface
-         include("./MOI_wrapper/MOI_wrapper.jl")
-    end
-    const Optimizer{T} = Clarabel.MOIwrapper.Optimizer{T}
+# Conic constraints. Additional
+# cone implementations go here
+# include("./cones/coneops_defaults.py")
+# include("./cones/coneops_zerocone.py")
+# include("./cones/coneops_nncone.py")
+# include("./cones/coneops_socone.py")
+# include("./cones/coneops_psdtrianglecone.py")
+# include("./cones/coneops_expcone.py")
+# include("./cones/coneops_powcone.py")
+# include("./cones/coneops_genpowcone.py")        # Generalized power cone
+# include("./cones/coneops_compositecone.py")
+# include("./cones/coneops_nonsymmetric_common.py")
+# include("./cones/coneops_symmetric_common.py")
 
+# GPU cone implementations
+# include("./gpucones/mathutilGPU.py")
+# include("./gpucones/coneops_zerocone_gpu.py")
+# include("./gpucones/coneops_nncone_gpu.py")
+# include("./gpucones/coneops_socone_gpu.py")
+# include("./gpucones/coneops_expcone_gpu.py")
+# include("./gpucones/coneops_powcone_gpu.py")
+# include("./gpucones/coneops_psdtrianglecone_gpu.py")
+# include("./gpucones/coneops_compositecone_gpu.py")
+# include("./gpucones/coneops_nonsymmetric_common_gpu.py")
+# include("./gpucones/augment_socp.py")
 
-    #precompile minimal MOI / native examples
-    using SnoopPrecompile
-    include("./precompile.jl")
-    redirect_stdout(devnull) do; 
-        SnoopPrecompile.@precompile_all_calls begin
-            __precompile_native()
-            __precompile_moi()
-        end
-    end
-    __precompile_printfcns()
+# Various algebraic utilities
+# include("./utils/mathutils.py")
+# include("./utils/csc_assembly.py")
 
-end #end module
+# Data updating
+# include("./data_updating.py")
+
+# Optional dependencies
+def __init__():
+    try:
+        import pardiso
+        # include("./kktsolvers/direct-ldl/directldl_pardiso.py")
+    except ImportError:
+        pass
+
+    try:
+        import hsl
+        # include("./kktsolvers/direct-ldl/directldl_hsl.py")
+    except ImportError:
+        pass
+
+# JSON I/O
+# include("./json.py")
+
+# MathOptInterface for JuMP/Convex.jl
+# module MOI  # extensions providing non-standard MOI constraint types
+#     include("./MOI_wrapper/MOI_extensions.py")
+# end
+# module MOIwrapper # our actual MOI interface
+#      include("./MOI_wrapper/MOI_wrapper.py")
+# end
+# const Optimizer{T} = Clarabel.MOIwrapper.Optimizer{T}
+
+# Precompile minimal MOI / native examples
+# using SnoopPrecompile
+# include("./precompile.py")
+# redirect_stdout(devnull) do;
+#     SnoopPrecompile.@precompile_all_calls begin
+#         __precompile_native()
+#         __precompile_moi()
+#     end
+# end
+# __precompile_printfcns()

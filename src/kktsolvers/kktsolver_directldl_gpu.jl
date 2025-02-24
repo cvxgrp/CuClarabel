@@ -1,389 +1,251 @@
-# -------------------------------------
-# KKTSolver using cudss direct solvers
-# -------------------------------------
+import cupy as cp
+import numpy as np
+from numba import cuda, njit
+from scipy.sparse import csc_matrix
 
-const CuVectorView{T} = SubArray{T, 1, AbstractVector{T}, Tuple{AbstractVector{Int}}, false}
-##############################################################
-# YC: Some functions are repeated as in the direct solver, which are better to be removed
-##############################################################
-mutable struct GPULDLKKTSolver{T} <: AbstractKKTSolver{T}
+class GPULDLKKTSolver:
+    def __init__(self, P, A, cones, m, n, settings):
+        self.m = m
+        self.n = n
 
-    # problem dimensions
-    m::Int; n::Int
+        self.x = cp.zeros(m + n, dtype=np.float64)
+        self.b = cp.zeros(m + n, dtype=np.float64)
+        self.work1 = cp.zeros(m + n, dtype=np.float64)
+        self.work2 = cp.zeros(m + n, dtype=np.float64)
 
-    # Left and right hand sides for solves
-    x::AbstractVector{T}
-    b::AbstractVector{T}
+        self.mapcpu = FullDataMap(P, A, cones)
+        self.mapgpu = GPUDataMap(P, A, cones, self.mapcpu)
 
-    # internal workspace for IR scheme
-    # and static offsetting of KKT
-    work1::AbstractVector{T}
-    work2::AbstractVector{T}
+        self.Dsigns = cp.zeros(m + n, dtype=np.int32)
+        self._fill_Dsigns(self.Dsigns, m, n, self.mapcpu)
 
-    #KKT mapping from problem data to KKT
-    mapcpu::FullDataMap
-    mapgpu::GPUDataMap 
+        self.Hsblocks = cp.zeros_like(self._allocate_kkt_Hsblocks(np.float64, cones))
 
-    #the expected signs of D in KKT = LDL^T
-    Dsigns::AbstractVector{Int}
+        self.KKTcpu, self.mapcpu = self._assemble_full_kkt_matrix(P, A, cones, 'full')
+        self.KKTgpu = cp.sparse.csr_matrix(self.KKTcpu)
 
-    # a vector for storing the Hs blocks
-    # on the in the KKT matrix block diagonal
-    Hsblocks::AbstractVector{T}
+        self.settings = settings
+        self.GPUsolver = CUDSSDirectLDLSolver(self.KKTgpu, self.x, self.b)
 
-    #unpermuted KKT matrix
-    KKTcpu::SparseMatrixCSC{T,Int}
-    KKTgpu::AbstractCuSparseMatrix{T}
+        self.diagonal_regularizer = 0.0
 
-    #settings just points back to the main solver settings.
-    #Required since there is no separate LDL settings container
-    settings::Settings{T}
+    def _fill_Dsigns(self, Dsigns, m, n, mapcpu):
+        Dsigns[:n] = 1
+        Dsigns[n:n + m] = -1
+        for i, cone in enumerate(mapcpu.sparse_maps):
+            Dsigns[n + m + i] = -1 if cone.Dsigns[0] == -1 else 1
 
-    #the direct linear LDL solver
-    GPUsolver::AbstractGPUSolver{T}
+    def _allocate_kkt_Hsblocks(self, dtype, cones):
+        return np.zeros(sum(cone.numel() for cone in cones), dtype=dtype)
 
-    #the diagonal regularizer currently applied
-    diagonal_regularizer::T
+    def _assemble_full_kkt_matrix(self, P, A, cones, shape):
+        map = FullDataMap(P, A, cones)
+        m, n = A.shape
+        p = pdim(map.sparse_maps)
 
-    function GPULDLKKTSolver{T}(P,A,cones,m,n,settings) where {T}
+        nnz_diagP = self._count_diagonal_entries_full(P)
+        nnz_Hsblocks = len(map.Hsblocks)
 
-        # get a constructor for the LDL solver we should use,
-        # and also the matrix shape it requires
-        (kktshape, GPUsolverT) = _get_GPUsolver_config(settings)
+        nnzKKT = (P.nnz + n - nnz_diagP + 2 * A.nnz + nnz_Hsblocks + 2 * nnz_vec(map.sparse_maps) + p)
 
-        #construct a KKT matrix of the right shape
-        KKTcpu, mapcpu = _assemble_full_kkt_matrix(P,A,cones,kktshape)
-        KKTgpu = CuSparseMatrixCSR(KKTcpu)
-
-        #YC: update GPU map, should be removed later on
-        mapgpu   = GPUDataMap(P,A,cones,mapcpu)
-
-        #YC: disabled sparse expansion and preprocess a large second-order cone into multiple small cones
-        p = pdim(mapcpu.sparse_maps)
-        @assert(iszero(p))
-
-        #updates to the diagonal of KKT will be
-        #assigned here before updating matrix entries
-        dim = m + n
-
-        #LHS/RHS/work for iterative refinement
-        x    = CuVector{T}(undef,dim)
-        b    = CuVector{T}(undef,dim)
-        work1 = CuVector{T}(undef,dim)
-        work2 = CuVector{T}(undef,dim)
-
-        #the expected signs of D in LDL
-        Dsigns_cpu = Vector{Int}(undef,dim)
-        _fill_Dsigns!(Dsigns_cpu,m,n,mapcpu)       #This is run on CPU
-        Dsigns = CuVector(Dsigns_cpu)
-
-        Hsblocks = CuVector(_allocate_kkt_Hsblocks(T, cones))
+        K = csc_matrix((m + n + p, m + n + p), dtype=P.dtype)
 
-        diagonal_regularizer = zero(T)
+        self._full_kkt_assemble_colcounts(K, P, A, cones, map)
+        self._full_kkt_assemble_fill(K, P, A, cones, map)
 
-        #the indirect linear solver engine
-        GPUsolver = GPUsolverT{T}(KKTgpu,x,b)
+        return K, map
 
-        return new(m,n,x,b,
-                   work1,work2,mapcpu,mapgpu,
-                   Dsigns,
-                   Hsblocks,
-                   KKTcpu,KKTgpu,settings,GPUsolver,
-                   diagonal_regularizer
-                   )
-    end
-
-end
+    def _full_kkt_assemble_colcounts(self, K, P, A, cones, map):
+        m, n = A.shape
 
-GPULDLKKTSolver(args...) = GPULDLKKTSolver{DefaultFloat}(args...)
+        K.indptr[:] = 0
 
-function _get_GPUsolver_type(s::Symbol)
-    try
-        return GPUSolversDict[s]
-    catch
-        throw(error("Unsupported gpu linear solver :", s))
-    end
-end
+        self._csc_colcount_block_full(K, P, A, 1)
+        self._csc_colcount_missing_diag_full(K, P, 1)
+        self._csc_colcount_block(K, A, n + 1, 'T')
 
-function _get_GPUsolver_config(settings::Settings)
+        pcol = m + n + 1
+        sparse_map_iter = iter(map.sparse_maps)
 
-    #which LDL solver should I use?
-    GPUsolverT = _get_GPUsolver_type(settings.direct_solve_method)
+        for i, cone in enumerate(cones):
+            row = cones.rng_cones[i][0] + n
 
-    #does it want a :full KKT matrix?
-    kktshape = required_matrix_shape(GPUsolverT)
-    @assert(kktshape == :full)
+            blockdim = cone.numel()
+            if self.Hs_is_diagonal(cone):
+                self._csc_colcount_diag(K, row, blockdim)
+            else:
+                self._csc_colcount_dense_full(K, row, blockdim)
 
-    (kktshape,GPUsolverT)
-end 
+            if self.is_sparse_expandable(cone):
+                thismap = next(sparse_map_iter)
+                self._csc_colcount_sparsecone_full(cone, thismap, K, row, pcol)
+                pcol += pdim(thismap)
 
+    def _full_kkt_assemble_fill(self, K, P, A, cones, map):
+        m, n = A.shape
 
-#update entries in the kktsolver object using the
-#given index into its CSC representation
-function _update_values!(
-    GPUsolver::AbstractGPUSolver{T},
-    KKT::AbstractSparseMatrix{T},
-    index::AbstractVector{Ti},
-    values::AbstractVector{T}
-) where{T,Ti}
+        self._csc_colcount_to_colptr(K)
 
-    #Update values in the KKT matrix K
-    @. KKT.nzVal[index] = values
+        self._csc_fill_P_block_with_missing_diag_full(K, P, map.P)
+        self._csc_fill_block(K, A, map.A, n + 1, 1, 'N')
+        self._csc_fill_block(K, A, map.At, 1, n + 1, 'T')
 
-end
+        pcol = m + n + 1
+        sparse_map_iter = iter(map.sparse_maps)
 
-#updates KKT matrix values
-function _update_diag_values_KKT!(
-    KKT::AbstractCuSparseMatrix{T},
-    index::AbstractVector{Ti},
-    values::AbstractVector{T}
-) where{T,Ti}
+        for i, cone in enumerate(cones):
+            row = cones.rng_cones[i][0] + n
 
-    #Update values in the KKT matrix K
-    @views copyto!(KKT.nzVal[index], values)
-    
-end
+            blockdim = cone.numel()
+            block = map.Hsblocks[cones.rng_blocks[i]]
 
-function kktsolver_update!(
-    kktsolver:: GPULDLKKTSolver{T},
-    cones::CompositeConeGPU{T}
-) where {T}
+            if self.Hs_is_diagonal(cone):
+                self._csc_fill_diag(K, block, row, blockdim)
+            else:
+                self._csc_fill_dense_full(K, block, row, blockdim)
 
-    # the internal  GPUsolver is type unstable, so multiple
-    # calls to the  GPUsolvers will be very slow if called
-    # directly.   Grab it here and then call an inner function
-    # so that the  GPUsolver has concrete type
-    GPUsolver = kktsolver.GPUsolver
-    return _kktsolver_update_inner!(kktsolver,GPUsolver,cones)
-end
+            if self.is_sparse_expandable(cone):
+                thismap = next(sparse_map_iter)
+                self._csc_fill_sparsecone_full(cone, thismap, K, row, pcol)
+                pcol += pdim(thismap)
 
+        self._kkt_backshift_colptrs(K)
 
-function _kktsolver_update_inner!(
-    kktsolver:: GPULDLKKTSolver{T},
-    GPUsolver::AbstractGPUSolver{T},
-    cones::CompositeConeGPU{T}
-) where {T}
+        self._map_diag_full(K, map.diag_full)
+        map.diagP[:] = map.diag_full[:n]
 
-    #real implementation is here, and now  GPUsolver
-    #will be compiled to something concrete.
+    def _update_values(self, GPUsolver, KKT, index, values):
+        KKT.data[index] = values
 
-    map       = kktsolver.mapgpu
-    KKT       = kktsolver.KKTgpu
+    def _update_diag_values_KKT(self, KKT, index, values):
+        KKT.data[index] = values
 
-    #Set the elements the W^tW blocks in the KKT matrix.
-    # get_Hs!(cones,kktsolver.Hsblockscpu,false)
-    get_Hs!(cones,kktsolver.Hsblocks)
+    def kktsolver_update(self, cones):
+        GPUsolver = self.GPUsolver
+        return self._kktsolver_update_inner(GPUsolver, cones)
 
-    @. kktsolver.Hsblocks *= -one(T)
-    _update_values!(GPUsolver,KKT,map.Hsblocks,kktsolver.Hsblocks)
+    def _kktsolver_update_inner(self, GPUsolver, cones):
+        map = self.mapgpu
+        KKT = self.KKTgpu
 
-    return _kktsolver_regularize_and_refactor!(kktsolver, GPUsolver)
+        self.get_Hs(cones, self.Hsblocks)
+        self.Hsblocks *= -1.0
+        self._update_values(GPUsolver, KKT, map.Hsblocks, self.Hsblocks)
 
-end
+        return self._kktsolver_regularize_and_refactor(GPUsolver)
 
-function _kktsolver_regularize_and_refactor!(
-    kktsolver::GPULDLKKTSolver{T},
-    GPUsolver::AbstractGPUSolver{T}
-) where{T}
+    def _kktsolver_regularize_and_refactor(self, GPUsolver):
+        settings = self.settings
+        map = self.mapgpu
+        KKTgpu = self.KKTgpu
+        Dsigns = self.Dsigns
+        diag_kkt = self.work1
+        diag_shifted = self.work2
 
-    settings      = kktsolver.settings
-    map           = kktsolver.mapgpu
-    KKTgpu        = kktsolver.KKTgpu
-    Dsigns        = kktsolver.Dsigns
-    diag_kkt      = kktsolver.work1
-    diag_shifted  = kktsolver.work2
+        if settings.static_regularization_enable:
+            diag_kkt[:] = KKTgpu.data[map.diag_full]
+            epsilon = self._compute_regularizer(diag_kkt, settings)
 
+            diag_shifted[:] = diag_kkt
+            diag_shifted += Dsigns * epsilon
 
-    if(settings.static_regularization_enable)
+            self._update_diag_values_KKT(KKTgpu, map.diag_full, diag_shifted)
+            self.diagonal_regularizer = epsilon
 
-        # hold a copy of the true KKT diagonal
-        @views diag_kkt .= KKTgpu.nzVal[map.diag_full]
-        ϵ = _compute_regularizer(diag_kkt, settings)
+        is_success = self.refactor(GPUsolver)
 
-        # compute an offset version, accounting for signs
-        diag_shifted .= diag_kkt
+        if settings.static_regularization_enable:
+            self._update_diag_values_KKT(KKTgpu, map.diag_full, diag_kkt)
 
-        diag_shifted .+= Dsigns*ϵ
+        return is_success
 
-        # overwrite the diagonal of KKT and within the  GPUsolver
-        _update_diag_values_KKT!(KKTgpu,map.diag_full,diag_shifted)
+    def _compute_regularizer(self, diag_kkt, settings):
+        maxdiag = np.linalg.norm(diag_kkt, np.inf)
+        regularizer = settings.static_regularization_constant + settings.static_regularization_proportional * maxdiag
+        return regularizer
 
-        # remember the value we used.  Not needed,
-        # but possibly useful for debugging
-        kktsolver.diagonal_regularizer = ϵ
+    def kktsolver_setrhs(self, rhsx, rhsz):
+        b = self.b
+        m, n = self.m, self.n
 
-    end
+        b[:n] = rhsx
+        b[n:n + m] = rhsz
 
-    is_success = refactor!(GPUsolver)
+    def kktsolver_getlhs(self, lhsx, lhsz):
+        x = self.x
+        m, n = self.m, self.n
 
-    if(settings.static_regularization_enable)
+        if lhsx is not None:
+            lhsx[:] = x[:n]
+        if lhsz is not None:
+            lhsz[:] = x[n:n + m]
 
-        # put our internal copy of the KKT matrix back the way
-        # it was. Not necessary to fix the  GPUsolver copy because
-        # this is only needed for our post-factorization IR scheme
+    def kktsolver_solve(self, lhsx, lhsz):
+        x, b = self.x, self.b
 
-        _update_diag_values_KKT!(KKTgpu,map.diag_full,diag_kkt)
+        self.solve(self.GPUsolver, x, b)
 
-    end
+        is_success = False
+        if self.settings.iterative_refinement_enable:
+            is_success = self._iterative_refinement(self.GPUsolver)
+        else:
+            is_success = np.all(np.isfinite(x))
 
-    return is_success
-end
+        if is_success:
+            self.kktsolver_getlhs(lhsx, lhsz)
 
+        return is_success
 
-# function _compute_regularizer(
-#     diag_kkt::AbstractVector{T},
-#     settings::Settings{T}
-# ) where {T}
+    def _iterative_refinement(self, GPUsolver):
+        x, b = self.x, self.b
+        e, dx = self.work1, self.work2
+        settings = self.settings
 
-#     maxdiag  = norm(diag_kkt,Inf);
+        IR_reltol = settings.iterative_refinement_reltol
+        IR_abstol = settings.iterative_refinement_abstol
+        IR_maxiter = settings.iterative_refinement_max_iter
+        IR_stopratio = settings.iterative_refinement_stop_ratio
 
-#     # Compute a new regularizer
-#     regularizer =  settings.static_regularization_constant +
-#                    settings.static_regularization_proportional * maxdiag
+        KKT = self.KKTgpu
+        normb = np.linalg.norm(b, np.inf)
 
-#     return regularizer
+        norme = self._get_refine_error(e, b, KKT, x)
+        if not np.isfinite(norme):
+            return False
 
-# end
+        for i in range(IR_maxiter):
+            if norme <= IR_abstol + IR_reltol * normb:
+                break
+            lastnorme = norme
 
+            self.solve(GPUsolver, dx, e)
 
-function kktsolver_setrhs!(
-    kktsolver::GPULDLKKTSolver{T},
-    rhsx::AbstractVector{T},
-    rhsz::AbstractVector{T}
-) where {T}
+            dx += x
+            norme = self._get_refine_error(e, b, KKT, dx)
+            if not np.isfinite(norme):
+                return False
 
-    b = kktsolver.b
-    (m,n) = (kktsolver.m,kktsolver.n)
+            improved_ratio = lastnorme / norme
+            if improved_ratio < IR_stopratio:
+                if improved_ratio > 1.0:
+                    x, dx = dx, x
+                break
+            x, dx = dx, x
 
-    b[1:n]             .= rhsx
-    b[(n+1):(n+m)]     .= rhsz
-    
-    CUDA.synchronize()
+        self.x, self.work2 = x, dx
 
-    return nothing
-end
+        return True
 
+    def _get_refine_error(self, e, b, KKT, xi):
+        e[:] = b - KKT @ xi
+        norme = np.linalg.norm(e, np.inf)
+        return norme
 
-function kktsolver_getlhs!(
-    kktsolver::GPULDLKKTSolver{T},
-    lhsx::Union{Nothing,AbstractVector{T}},
-    lhsz::Union{Nothing,AbstractVector{T}}
-) where {T}
+    def solve(self, GPUsolver, x, b):
+        solve(GPUsolver, x, b)
 
-    x = kktsolver.x
-    (m,n) = (kktsolver.m,kktsolver.n)
+    def refactor(self, GPUsolver):
+        return refactor(GPUsolver)
 
-    isnothing(lhsx) || (@views lhsx .= x[1:n])
-    isnothing(lhsz) || (@views lhsz .= x[(n+1):(n+m)])
-
-    CUDA.synchronize()
-
-    return nothing
-end
-
-
-function kktsolver_solve!(
-    kktsolver::GPULDLKKTSolver{T},
-    lhsx::Union{Nothing,AbstractVector{T}},
-    lhsz::Union{Nothing,AbstractVector{T}}
-) where {T}
-
-    (x,b) = (kktsolver.x,kktsolver.b)
-
-    solve!(kktsolver.GPUsolver,x,b)
-
-    is_success = begin
-        if(kktsolver.settings.iterative_refinement_enable)
-            #IR reports success based on finite normed residual
-            is_success = _iterative_refinement(kktsolver,kktsolver.GPUsolver)
-        else
-             # otherwise must directly verify finite values
-            is_success = all(isfinite,x)
-        end
-    end
-
-    if is_success
-       kktsolver_getlhs!(kktsolver,lhsx,lhsz)
-    end
-
-    return is_success
-end
-
-function  _iterative_refinement(
-    kktsolver::GPULDLKKTSolver{T},
-    GPUsolver::AbstractGPUSolver{T}
-) where{T}
-
-    (x,b)   = (kktsolver.x,kktsolver.b)
-    (e,dx)  = (kktsolver.work1, kktsolver.work2)
-    settings = kktsolver.settings
-
-    #iterative refinement params
-    IR_reltol    = settings.iterative_refinement_reltol
-    IR_abstol    = settings.iterative_refinement_abstol
-    IR_maxiter   = settings.iterative_refinement_max_iter
-    IR_stopratio = settings.iterative_refinement_stop_ratio
-
-    KKT = kktsolver.KKTgpu
-    normb  = norm(b,Inf)
-
-    #compute the initial error
-    norme = _get_refine_error!(e,b,KKT,x)
-    isfinite(norme) || return is_success = false
-
-    for i = 1:IR_maxiter
-
-        if(norme <= IR_abstol + IR_reltol*normb)
-            # within tolerance, or failed.  Exit
-            break
-        end
-        lastnorme = norme
-
-        #make a refinement and continue
-        solve!(GPUsolver,dx,e)
-
-        #prospective solution is x + dx.   Use dx space to
-        #hold it for a check before applying to x
-        @. dx += x
-        CUDA.synchronize()
-        norme = _get_refine_error!(e,b,KKT,dx)
-        isfinite(norme) || return is_success = false
-
-        improved_ratio = lastnorme/norme
-        if(improved_ratio <  IR_stopratio)
-            #insufficient improvement.  Exit
-            if (improved_ratio > one(T))
-                (x,dx) = (dx,x)   #pointer swap
-            end
-            break
-        end
-        (x,dx) = (dx,x)           #pointer swap
-    end
-
-    # make sure kktsolver fields now point to the right place
-    # following possible swaps.   This is not necessary in the
-    # Rust implementation since implementation there is via borrow
-    (kktsolver.x,kktsolver.work2) = (x,dx)
- 
-    #NB: "success" means only that we had a finite valued result
-    return is_success = true
-end
-
-
-# # computes e = b - Kξ, overwriting the first argument
-# # and returning its norm
-
-function _get_refine_error!(
-    e::AbstractVector{T},
-    b::AbstractVector{T},
-    KKT::AbstractCuSparseMatrix{T},
-    ξ::AbstractVector{T}) where {T}
-
-    
-    mul!(e,KKT,ξ)    # e = b - Kξ
-    @. e = b - e
-    CUDA.synchronize()
-    norme = norm(e,Inf)
-
-    return norme
-end
+    def get_Hs(self, cones, Hsblocks):
+        get_Hs(cones, Hsblocks)

@@ -1,80 +1,42 @@
-using CUDA, CUDA.CUSPARSE
-using CUDSS
+import cupy as cp
+import numpy as np
+from numba import cuda, njit
+from cudss import CudssSolver, cudss, cudss_set, ldiv
 
-export CUDSSDirectLDLSolverMixed
-struct CUDSSDirectLDLSolverMixed{T} <: AbstractGPUSolver{T}
+class CUDSSDirectLDLSolverMixed:
+    def __init__(self, KKT, x, b):
+        dim = KKT.shape[0]
 
-    KKTgpu::AbstractSparseMatrix{T}
-    cudssSolver::CUDSS.CudssSolver{Float32}
+        self.KKTgpu = KKT
 
-    KKTFloat32::AbstractSparseMatrix{Float32}
-    xFloat32::AbstractVector{Float32}
-    bFloat32::AbstractVector{Float32}
-    
+        val = cp.array(KKT.data, dtype=np.float32)
+        self.KKTFloat32 = cp.sparse.csr_matrix((val, KKT.indices, KKT.indptr), shape=KKT.shape)
+        self.cudssSolver = CudssSolver(self.KKTFloat32, "S", 'F')
 
-    function CUDSSDirectLDLSolverMixed{T}(KKT::AbstractSparseMatrix{T},x,b) where {T}
+        self.xFloat32 = cp.zeros(dim, dtype=np.float32)
+        self.bFloat32 = cp.zeros(dim, dtype=np.float32)
 
-        dim = LinearAlgebra.checksquare(KKT)
+        cudss("analysis", self.cudssSolver, self.xFloat32, self.bFloat32)
+        cudss("factorization", self.cudssSolver, self.xFloat32, self.bFloat32)
 
-        #make a logical factorization to fix memory allocations
-        # "S" denotes real symmetric and 'U' denotes the upper triangular
+GPUSolversDict = {}
+GPUSolversDict['cudssmixed'] = CUDSSDirectLDLSolverMixed
 
-        KKTgpu = KKT
+def required_matrix_shape():
+    return 'full'
 
-        val = CuVector{Float32}(KKTgpu.nzVal)
-        KKTFloat32 = CuSparseMatrixCSR(KKTgpu.rowPtr,KKTgpu.colVal,val,size(KKTgpu))
-        cudssSolver = CUDSS.CudssSolver(KKTFloat32, "S", 'F')
+def refactor(ldlsolver):
+    ldlsolver.KKTFloat32.data = ldlsolver.KKTgpu.data.astype(np.float32)
 
-        xFloat32 = CUDA.zeros(Float32,dim)
-        bFloat32 = CUDA.zeros(Float32,dim)
-
-        cudss("analysis", cudssSolver, xFloat32, bFloat32)
-        cudss("factorization", cudssSolver, xFloat32, bFloat32)
-
-
-        return new(KKTgpu,cudssSolver,KKTFloat32,xFloat32,bFloat32)
-    end
-
-end
-
-GPUSolversDict[:cudssmixed] = CUDSSDirectLDLSolverMixed
-required_matrix_shape(::Type{CUDSSDirectLDLSolverMixed}) = :full
-
-#refactor the linear system
-function refactor!(ldlsolver::CUDSSDirectLDLSolverMixed{T}) where{T}
-
-    #YC: Copy data from a Float64 matrix to Float32 matrix
-    copyto!(ldlsolver.KKTFloat32.nzVal,ldlsolver.KKTgpu.nzVal)
-
-    # Update the KKT matrix in the cudss solver
-    cudss_set(ldlsolver.cudssSolver.matrix,ldlsolver.KKTFloat32)
-
-    # Refactorization
+    cudss_set(ldlsolver.cudssSolver.matrix, ldlsolver.KKTFloat32)
     cudss("factorization", ldlsolver.cudssSolver, ldlsolver.xFloat32, ldlsolver.bFloat32)
 
-    # YC: should be corrected later on 
-    return true
-    # return all(isfinite, cudss_get(ldlsolver.cudssSolver.data,"diag"))
+    return True
 
-end
-
-#solve the linear system
-function solve!(
-    ldlsolver::CUDSSDirectLDLSolverMixed{T},
-    x::AbstractVector{T},
-    b::AbstractVector{T}
-) where{T}
-
-    xFloat32 = ldlsolver.xFloat32
+def solve(ldlsolver, x, b):
     bFloat32 = ldlsolver.bFloat32
+    bFloat32[:] = b
 
-    #convert b to Float32
-    copyto!(bFloat32, b)
+    ldiv(ldlsolver.xFloat32, ldlsolver.cudssSolver, bFloat32)
 
-    #solve on GPU
-    ldiv!(xFloat32, ldlsolver.cudssSolver, bFloat32)
-
-    #convert to Float64, copy to x 
-    copyto!(x, xFloat32)
-
-end
+    x[:] = ldlsolver.xFloat32

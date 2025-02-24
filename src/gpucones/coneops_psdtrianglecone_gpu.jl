@@ -1,321 +1,102 @@
-using GenericLinearAlgebra  # extends SVD, eigs etc for BigFloats
+import cupy as cp
+import numpy as np
+from numba import cuda, njit
 
-# # ----------------------------------------------------
-# # Positive Semidefinite Cone
-# # ----------------------------------------------------
+@njit
+def margins_psd(Z, z, rng_cones, n_shift, n_psd, αmin):
+    svec_to_mat_gpu(Z, z, rng_cones, n_shift, n_psd)
+    e = np.linalg.eigvalsh(Z)
+    αmin = min(αmin, np.min(e))
+    e = np.maximum(e, 0)
+    return αmin, np.sum(e)
 
-# degree(K::PSDTriangleCone{T}) where {T} = K.n        #side dimension, M \in \mathcal{S}^{n×n}
-# numel(K::PSDTriangleCone{T})  where {T} = K.numel    #number of elements
-
-# function margins is implemented explicitly into the compositecone operation
-@inline function margins_psd(
-    Z::AbstractArray{T,3},
-    z::AbstractVector{T},
-    rng_cones::AbstractVector,
-    n_shift::Cint,
-    n_psd::Cint,
-    αmin::T
-) where {T}
-    svec_to_mat_gpu!(Z, z, rng_cones, n_shift, n_psd)
-
-    # Batched SVD decomposition
-    # YC: memory of e can be optimized later
-    e = CUDA.CUSOLVER.syevjBatched!('N','U', Z)      #'N' returns eigenvalues only; 'V' returns both eigenvalues and eigenvectors
-    αmin = min(αmin, minimum(e))
-    CUDA.@sync @. e = max(e, zero(T))
-    return (αmin, sum(e))
-end
-
-# place vector into sdp cone
-function _kernel_scaled_unit_shift_psd!(
-    z::AbstractVector{T},
-    α::T,
-    rng_cones::AbstractVector,
-    psd_dim::Cint,
-    n_shift::Cint,
-    n_psd::Cint
-) where{T}
-
-    i = (blockIdx().x-1)*blockDim().x+threadIdx().x
-
-    if i <= n_psd
-        # #adds αI to the vectorized triangle,
-        # #at elements [1,3,6....n(n+1)/2]
+@njit
+def scaled_unit_shift_psd(z, α, rng_cones, psd_dim, n_shift, n_psd):
+    for i in range(n_psd):
         shift_i = i + n_shift
         rng_cone_i = rng_cones[shift_i]
-        @views zi = z[rng_cone_i] 
-        @inbounds for k = 1:psd_dim
-            zi[triangular_index(k)] += α
-        end
-    end
+        for k in range(psd_dim):
+            z[rng_cone_i[k * (k + 1) // 2 + k]] += α
 
-    return nothing
-end
+@njit
+def unit_initialization_psd(z, s, rng_cones, psd_dim, n_shift, n_psd):
+    for i in range(n_psd):
+        shift_i = i + n_shift
+        rng_cone_i = rng_cones[shift_i]
+        s[rng_cone_i] = 0
+        z[rng_cone_i] = 0
+    α = 1
+    scaled_unit_shift_psd(z, α, rng_cones, psd_dim, n_shift, n_psd)
+    scaled_unit_shift_psd(s, α, rng_cones, psd_dim, n_shift, n_psd)
 
-@inline function scaled_unit_shift_psd!(
-    z::AbstractVector{T},
-    α::T,
-    rng_cones::AbstractVector,
-    psd_dim::Cint,
-    n_shift::Cint,
-    n_psd::Cint
-) where {T}
-    kernel = @cuda launch=false _kernel_scaled_unit_shift_psd!(z, α, rng_cones, psd_dim, n_shift, n_psd)
-    config = launch_configuration(kernel.fun)
-    threads = min(n_psd, config.threads)
-    blocks = cld(n_psd, threads)
+@njit
+def set_identity_scaling_psd(R, Rinv, Hspsd, psd_dim, n_psd):
+    for i in range(n_psd):
+        for k in range(psd_dim):
+            R[k, k, i] = 1
+            Rinv[k, k, i] = 1
+        for k in range(psd_dim * (psd_dim + 1) // 2):
+            Hspsd[k, k, i] = 1
 
-    CUDA.@sync kernel(z, α, rng_cones, psd_dim, n_shift, n_psd; threads, blocks)
-end
+def update_scaling_psd(L1, L2, z, s, workmat1, λpsd, Λisqrt, R, Rinv, Hspsd, rng_cones, n_shift, n_psd):
+    svec_to_mat_gpu(L2, z, rng_cones, n_shift, n_psd)
+    svec_to_mat_gpu(L1, s, rng_cones, n_shift, n_psd)
 
-# unit initialization for asymmetric solves
-@inline function unit_initialization_psd_gpu!(
-    z::AbstractVector{T},
-    s::AbstractVector{T},
-    rng_cones::AbstractVector,
-    psd_dim::Cint,
-    n_shift::Cint,
-    n_psd::Cint
- ) where{T}
- 
-    CUDA.@allowscalar begin
-        rng = rng_cones[n_shift+1].start:rng_cones[n_shift+n_psd].stop
-        @views fill!(s[rng],zero(T))
-        @views fill!(z[rng],zero(T))
-    end
-    α = one(T)
+    _, infoz = np.linalg.cholesky(L2)
+    _, infos = np.linalg.cholesky(L1)
 
-    scaled_unit_shift_psd!(z,α,rng_cones,psd_dim,n_shift,n_psd)
-    scaled_unit_shift_psd!(s,α,rng_cones,psd_dim,n_shift,n_psd)
- 
-    return nothing
- end
+    if not (np.all(infoz == 0) and np.all(infos == 0)):
+        return False
 
-# # configure cone internals to provide W = I scaling
-function _kernel_set_identity_scaling_psd!(
-    R::AbstractArray{T,3},
-    Rinv::AbstractArray{T,3},
-    Hspsd::AbstractArray{T,3},
-    psd_dim::Cint,
-    n_psd::Cint
-) where {T}
+    tmp = workmat1
+    tmp = np.dot(L2.T, L1)
+    U, S, V = np.linalg.svd(tmp)
 
-    i = (blockIdx().x-1)*blockDim().x+threadIdx().x
+    λpsd[:] = S
+    Λisqrt[:] = 1 / np.sqrt(λpsd)
 
-    if i <= n_psd
-        #Other entries of R, Rinv, Hspsd to 0's
-        @inbounds for k in 1:psd_dim
-            R[k,k,i] = one(T)
-            Rinv[k,k,i] = one(T)
-        end
-        @inbounds for k in 1:triangular_number(psd_dim)     
-            Hspsd[k,k,i] = one(T)
-        end
-    end
+    R[:] = np.dot(L1, V)
+    R[:] = np.dot(R, np.diag(Λisqrt))
 
-    return nothing
-end
+    Rinv[:] = np.dot(U.T, L2.T)
+    Rinv[:] = np.dot(np.diag(Λisqrt), Rinv)
 
-@inline function set_identity_scaling_psd!(
-    R::AbstractArray{T,3},
-    Rinv::AbstractArray{T,3},
-    Hspsd::AbstractArray{T,3},
-    psd_dim::Cint,
-    n_psd::Cint
-) where {T}
-    kernel = @cuda launch=false _kernel_set_identity_scaling_psd!(R, Rinv, Hspsd, psd_dim, n_psd)
-    config = launch_configuration(kernel.fun)
-    threads = min(n_psd, config.threads)
-    blocks = cld(n_psd, threads)
+    RRt = workmat1
+    RRt[:] = np.dot(R, R.T)
 
-    CUDA.@sync kernel(R, Rinv, Hspsd, psd_dim, n_psd; threads, blocks)
-end
+    Hspsd[:] = np.kron(RRt, RRt)
 
-@inline function update_scaling_psd!(
-    L1::AbstractArray{T,3},
-    L2::AbstractArray{T,3},
-    z::AbstractVector{T},
-    s::AbstractVector{T},
-    workmat1::AbstractArray{T,3},
-    λpsd::AbstractMatrix{T},
-    Λisqrt::AbstractMatrix{T},
-    R::AbstractArray{T,3},
-    Rinv::AbstractArray{T,3},
-    Hspsd::AbstractArray{T,3},
-    rng_cones::AbstractVector,
-    n_shift::Cint,
-    n_psd::Cint
-) where {T}
+    return True
 
-    svec_to_mat_gpu!(L2,z,rng_cones,n_shift,n_psd)
-    svec_to_mat_gpu!(L1,s,rng_cones,n_shift,n_psd)
-
-    _, infoz = potrfBatched!(L2, 'L')
-    _, infos = potrfBatched!(L1, 'L')
-
-    # YC: This is an issue related to the batched Cholesky factorization in CUSOLVER,
-    # which fills in both lower and upper triangular of each submatrix during factorization
-    #Set upper triangular parts to 0
-    mask_zeros!(L2, 'U')
-    mask_zeros!(L1, 'U')
-
-    # bail if the cholesky factorization fails
-    if !(all(==(0), infoz) && all(==(0), infos))
-        return is_scaling_success = false
-    end
-
-    #SVD of L2'*L1,
-    tmp = workmat1;
-    CUDA.CUBLAS.gemm_strided_batched!('T', 'N', one(T), L2, L1, zero(T), tmp)
-    U, S, V = CUDA.CUSOLVER.gesvdj!('V', tmp)
-
-    #assemble λ (diagonal), R and Rinv.
-    copyto!(λpsd, S)
-    CUDA.@sync @. Λisqrt = inv.(sqrt.(λpsd))
-
-    #R = L1*(V)*Λisqrt  Λisqrt is a diagonal matrix for each psd cone
-    CUDA.CUBLAS.gemm_strided_batched!('N', 'N', one(T), L1, V, zero(T), R)
-    right_mul_batched!(R,Λisqrt,R)
-
-    #Rinv = Λisqrt*(U)'*L2'
-    CUDA.CUBLAS.gemm_strided_batched!('T', 'T', one(T), U, L2, zero(T), Rinv)
-    left_mul_batched!(Λisqrt,Rinv,Rinv)
-
-    #compute R*R' (upper triangular part only)
-    RRt = workmat1;
-    fill!(RRt, zero(T))
-    CUDA.CUBLAS.gemm_strided_batched!('N', 'T', one(T), R, R, zero(T), RRt)
-
-    #YC: RRt may not be symmetric, not sure how much effect it will be
-    skron_batched!(Hspsd,RRt)
-end
-
-function _kernel_get_Hs_psd!(
-    Hsblock::AbstractVector{T},
-    Hs::AbstractArray{T,3},
-    rng_blocks::AbstractVector,
-    n_shift::Cint,
-    n_psd::Cint
-) where {T}
-
-    i = (blockIdx().x-1)*blockDim().x+threadIdx().x
-
-    if i <= n_psd
+@njit
+def get_Hs_psd(Hsblocks, Hs, rng_blocks, n_shift, n_psd):
+    for i in range(n_psd):
         shift_i = i + n_shift
         rng_i = rng_blocks[shift_i]
-        @views Hsi = Hs[:,:,i]
-        @views Hsblocki = Hsblock[rng_i]
-        
-        @inbounds for j in 1:length(Hsblocki)
-            Hsblocki[j] = Hsi[j]
-        end
-    end
+        Hsblocks[rng_i] = Hs[i].flatten()
 
-    return nothing
+def mul_Hs_psd(y, x, Hspsd, rng_cones, n_shift, n_psd, psd_dim):
+    rng = np.concatenate([rng_cones[i] for i in range(n_shift + 1, n_shift + n_psd + 1)])
+    tmpx = x[rng]
+    tmpy = y[rng]
 
-end
+    n_tri_dim = psd_dim * (psd_dim + 1) // 2
+    n_psd_int64 = int(n_psd)
 
-@inline function get_Hs_psd!(
-    Hsblocks::AbstractVector{T},
-    Hspsd::AbstractArray{T,3},
-    rng_blocks::AbstractVector,
-    n_shift::Cint,
-    n_psd::Cint
-) where {T}
+    X = tmpx.reshape((n_tri_dim, n_psd_int64))
+    Y = tmpy.reshape((n_tri_dim, n_psd_int64))
 
-    kernel = @cuda launch=false _kernel_get_Hs_psd!(Hsblocks, Hspsd, rng_blocks, n_shift, n_psd)
-    config = launch_configuration(kernel.fun)
-    threads = min(n_psd, config.threads)
-    blocks = cld(n_psd, threads)
+    Y[:] = np.dot(Hspsd, X)
 
-    CUDA.@sync kernel(Hsblocks, Hspsd, rng_blocks, n_shift, n_psd; threads, blocks)
+@njit
+def affine_ds_psd(ds, λpsd, rng_cones, psd_dim, n_shift, n_psd):
+    for i in range(n_psd):
+        shift_idx = rng_cones[n_shift + i].start - 1
+        for k in range(psd_dim):
+            ds[shift_idx + k * (k + 1) // 2 + k] = λpsd[k, i] ** 2
 
-end
-
-# compute the product y = WᵀWx
-@inline function mul_Hs_psd!(
-    y::AbstractVector{T},
-    x::AbstractVector{T},
-    Hspsd::AbstractArray{T,3},
-    rng_cones::AbstractVector,
-    n_shift::Cint,
-    n_psd::Cint,
-    psd_dim::Cint
-) where {T}
-    CUDA.@allowscalar rng = rng_cones[n_shift+1].start:rng_cones[n_shift+n_psd].stop
-
-    #Transform it into the matrix form 
-    @views tmpx = x[rng]
-    @views tmpy = y[rng]
-
-    n_tri_dim = triangular_number(psd_dim)
-    n_psd_int64 = Int64(n_psd)
-
-    X = reshape(tmpx, (n_tri_dim, n_psd_int64))
-    Y = reshape(tmpy, (n_tri_dim, n_psd_int64))
-
-    CUDA.CUBLAS.gemv_strided_batched!('N', one(T), Hspsd, X, zero(T), Y)
-end
-
-# returns ds = λ ∘ λ for the SDP cone
-function _kernel_affine_ds_psd!(
-    ds::AbstractVector{T},
-    λpsd::AbstractMatrix{T},
-    rng_cones::AbstractVector,
-    psd_dim::Cint,
-    n_shift::Cint,
-    n_psd::Cint
-) where {T}
-
-    i = (blockIdx().x-1)*blockDim().x+threadIdx().x
-
-    if i <= n_psd
-        #We have Λ = Diagonal(K.λ), so
-        #λ ∘ λ should map to Λ.^2
-        shift_idx = rng_cones[n_shift+i].start - 1
-        #same as X = Λ*Λ
-        @inbounds for k = 1:psd_dim
-            ds[shift_idx+triangular_index(k)] = λpsd[k,i]^2
-        end
-    end
-
-    return nothing
-end
-
-@inline function affine_ds_psd_gpu!(
-    ds::AbstractVector{T},
-    λpsd::AbstractMatrix{T},
-    rng_cones::AbstractVector,
-    psd_dim::Cint,
-    n_shift::Cint,
-    n_psd::Cint
-) where {T}
-
-    CUDA.@allowscalar begin
-        rng = rng_cones[n_shift+1].start:rng_cones[n_shift+n_psd].stop
-    end
-    @views fill!(ds[rng],zero(T))
-
-    kernel = @cuda launch=false _kernel_affine_ds_psd!(ds,λpsd,rng_cones,psd_dim,n_shift,n_psd)
-    config = launch_configuration(kernel.fun)
-    threads = min(n_psd, config.threads)
-    blocks = cld(n_psd, threads)
-
-    CUDA.@sync kernel(ds,λpsd,rng_cones,psd_dim,n_shift,n_psd; threads, blocks)
-end
-
-@inline function combined_ds_shift_psd!(
-    cones::CompositeConeGPU{T},
-    shift::AbstractVector{T},
-    step_z::AbstractVector{T},
-    step_s::AbstractVector{T},
-    n_shift::Cint,
-    n_psd::Cint,
-    σμ::T
-) where {T}
-
-    #shift vector used as workspace for a few steps 
-    tmp = shift    
+def combined_ds_shift_psd(cones, shift, step_z, step_s, n_shift, n_psd, σμ):
+    tmp = shift.copy()
     R = cones.R
     Rinv = cones.Rinv
     rng_cones = cones.rng_cones
@@ -323,85 +104,34 @@ end
     workmat2 = cones.workmat2
     workmat3 = cones.workmat3
     psd_dim = cones.psd_dim
-    
-    CUDA.@allowscalar begin
-        rng = rng_cones[n_shift+1].start:rng_cones[n_shift+n_psd].stop
-    end
 
-     #Δz <- WΔz
-    CUDA.@sync @. tmp[rng] = step_z[rng]        
-    mul_Wx_psd!(step_z, tmp, R, rng_cones, workmat1, workmat2, workmat3, n_shift, n_psd, false)     
+    rng = np.concatenate([rng_cones[i] for i in range(n_shift + 1, n_shift + n_psd + 1)])
 
-    #Δs <- W⁻TΔs
-    CUDA.@sync @. tmp[rng] = step_s[rng]            
-    mul_WTx_psd!(step_s, tmp, Rinv, rng_cones, workmat1, workmat2, workmat3, n_shift, n_psd, false)   
+    tmp[rng] = step_z[rng]
+    mul_Wx_psd(step_z, tmp, R, rng_cones, workmat1, workmat2, workmat3, n_shift, n_psd, False)
 
-    #shift = W⁻¹Δs ∘ WΔz - σμe
-    #X  .= (Y*Z + Z*Y)/2 
-    # NB: Y and Z are both symmetric
-    svec_to_mat_gpu!(workmat1,step_z,rng_cones,n_shift,n_psd)
-    svec_to_mat_gpu!(workmat2,step_s,rng_cones,n_shift,n_psd)
-    CUDA.CUBLAS.gemm_strided_batched!('N', 'N', one(T), workmat1, workmat2, zero(T), workmat3)
-    symmetric_part_gpu!(workmat3)
+    tmp[rng] = step_s[rng]
+    mul_WTx_psd(step_s, tmp, Rinv, rng_cones, workmat1, workmat2, workmat3, n_shift, n_psd, False)
 
-    mat_to_svec_gpu!(shift,workmat3,rng_cones,n_shift,n_psd)       
-    
-    scaled_unit_shift_psd!(shift,-σμ,rng_cones,psd_dim,n_shift,n_psd)                     
+    svec_to_mat_gpu(workmat1, step_z, rng_cones, n_shift, n_psd)
+    svec_to_mat_gpu(workmat2, step_s, rng_cones, n_shift, n_psd)
+    workmat3 = np.dot(workmat1, workmat2)
+    workmat3 = (workmat3 + workmat3.T) / 2
 
-    return nothing
+    mat_to_svec_gpu(shift, workmat3, rng_cones, n_shift, n_psd)
+    scaled_unit_shift_psd(shift, -σμ, rng_cones, psd_dim, n_shift, n_psd)
 
-end
+@njit
+def op_λ(X, Z, λpsd, psd_dim, n_psd):
+    for i in range(n_psd):
+        Xi = X[:, :, i]
+        Zi = Z[:, :, i]
+        λi = λpsd[:, i]
+        for k in range(psd_dim):
+            for j in range(psd_dim):
+                Xi[k, j] = 2 * Zi[k, j] / (λi[k] + λi[j])
 
-
-function _kernel_op_λ!(
-    X::AbstractArray{T,3},
-    Z::AbstractArray{T,3},
-    λpsd::AbstractMatrix{T},
-    psd_dim::Cint,
-    n_psd::Cint
-) where {T}
-
-    i = (blockIdx().x-1)*blockDim().x+threadIdx().x
-
-    if i <= n_psd
-        @views Xi = X[:,:,i]
-        @views Zi = Z[:,:,i]
-        @views λi = λpsd[:,i]
-        for k = 1:psd_dim
-            for j = 1:psd_dim
-                Xi[k,j] = 2*Zi[k,j]/(λi[k] + λi[j])
-            end
-        end
-    end
-
-    return nothing
-end
-
-@inline function op_λ!(
-    X::AbstractArray{T,3},
-    Z::AbstractArray{T,3},
-    λpsd::AbstractMatrix{T},
-    psd_dim::Cint,
-    n_psd::Cint
-) where {T}
-
-    kernel = @cuda launch=false _kernel_op_λ!(X, Z, λpsd, psd_dim, n_psd)
-    config = launch_configuration(kernel.fun)
-    threads = min(n_psd, config.threads)
-    blocks = cld(n_psd, threads)
-
-    CUDA.@sync kernel(X, Z, λpsd, psd_dim, n_psd; threads, blocks)
-end
-
-@inline function Δs_from_Δz_offset_psd!(
-    cones::CompositeConeGPU{T},
-    out::AbstractVector{T},
-    ds::AbstractVector{T},
-    work::AbstractVector{T},
-    n_shift::Cint,
-    n_psd::Cint
-) where {T}
-
+def Δs_from_Δz_offset_psd(cones, out, ds, work, n_shift, n_psd):
     R = cones.R
     λpsd = cones.λpsd
     rng_cones = cones.rng_cones
@@ -410,508 +140,181 @@ end
     workmat3 = cones.workmat3
     psd_dim = cones.psd_dim
 
-    #tmp = λ \ ds 
-    svec_to_mat_gpu!(workmat2, ds, rng_cones, n_shift, n_psd)
-    op_λ!(workmat1, workmat2, λpsd, psd_dim, n_psd)
-    mat_to_svec_gpu!(work, workmat1, rng_cones, n_shift, n_psd) 
+    svec_to_mat_gpu(workmat2, ds, rng_cones, n_shift, n_psd)
+    op_λ(workmat1, workmat2, λpsd, psd_dim, n_psd)
+    mat_to_svec_gpu(work, workmat1, rng_cones, n_shift, n_psd)
 
-    #out = Wᵀ(λ \ ds) = Wᵀ(work) 
-    mul_WTx_psd!(out, work, R, rng_cones, workmat1, workmat2, workmat3, n_shift, n_psd, false)   
+    mul_WTx_psd(out, work, R, rng_cones, workmat1, workmat2, workmat3, n_shift, n_psd, False)
 
-end
+def step_length_psd(dz, ds, Λisqrt, d, Rx, Rinv, workmat1, workmat2, workmat3, αmax, rng_cones, n_shift, n_psd):
+    workΔ = workmat1
+    mul_Wx_psd(d, dz, Rx, rng_cones, workmat1, workmat2, workmat3, n_shift, n_psd, True)
+    αz = step_length_psd_component(workΔ, d, Λisqrt, n_psd, αmax)
 
-@inline function step_length_psd(
-    dz::AbstractVector{T},
-    ds::AbstractVector{T},
-    Λisqrt::AbstractMatrix{T}, 
-    d::AbstractVector{T}, 
-    Rx::AbstractArray{T,3}, 
-    Rinv::AbstractArray{T,3}, 
-    workmat1::AbstractArray{T,3}, 
-    workmat2::AbstractArray{T,3}, 
-    workmat3::AbstractArray{T,3},
-    αmax::T,
-    rng_cones::AbstractVector,
-    n_shift::Cint, 
-    n_psd::Cint
-) where {T}
+    mul_WTx_psd(d, ds, Rinv, rng_cones, workmat1, workmat2, workmat3, n_shift, n_psd, True)
+    αs = step_length_psd_component(workΔ, d, Λisqrt, n_psd, αmax)
 
-    workΔ  = workmat1
-    #d = Δz̃ = WΔz
-    # We need an extra parameter since the dimension of d is not equal to that of dz
-    # αz = step_length_psd_component(workΔ,d,Λisqrt,αmax)
-    mul_Wx_psd!(d, dz, Rx, rng_cones, workmat1, workmat2, workmat3, n_shift, n_psd, true)
-    αz = step_length_psd_component_gpu(workΔ, d, Λisqrt, n_psd, αmax)
-    
-    #d = Δs̃ = W^{-T}Δs
-    mul_WTx_psd!(d, ds, Rinv, rng_cones, workmat1, workmat2, workmat3, n_shift, n_psd, true)
-    αs = step_length_psd_component_gpu(workΔ, d, Λisqrt, n_psd, αmax)
-    
-    @views αmax = min(αmax,αz,αs)
+    αmax = min(αmax, αz, αs)
 
     return αmax
-end
 
-function _kernel_logdet!(
-    barrier::AbstractVector{T},
-    fact::AbstractArray{T,3},
-    psd_dim::Cint,
-    n_psd::Cint
-) where {T}
-    i = (blockIdx().x-1)*blockDim().x+threadIdx().x
+@njit
+def logdet_barrier_psd(barrier, fact, psd_dim, n_psd):
+    for i in range(n_psd):
+        val = 0
+        for k in range(psd_dim):
+            val += np.log(fact[k, k, i])
+        barrier[i] = 2 * val
 
-    if i <= n_psd
-        val = zero(T)
-        @inbounds for k = 1:psd_dim
-            val += logsafe(fact[k,k,i])
-        end
-        barrier[i] = val + val
-    end
+def compute_barrier_psd(barrier, z, s, dz, ds, α, workmat1, workvec, rng_cones, psd_dim, n_shift, n_psd):
+    rng = np.concatenate([rng_cones[i] for i in range(n_shift + 1, n_shift + n_psd + 1)])
 
-    return nothing
-end
+    barrier_d = logdet_barrier_psd(barrier, z + α * dz, psd_dim, n_psd)
+    barrier_p = logdet_barrier_psd(barrier, s + α * ds, psd_dim, n_psd)
+    return -barrier_d - barrier_p
 
-@inline function _logdet_barrier_psd(
-    barrier::AbstractVector{T},
-    x::AbstractVector{T},
-    dx::AbstractVector{T},
-    alpha::T,
-    workmat1::AbstractArray{T,3},
-    workvec::AbstractVector{T},
-    rng::UnitRange{Cint},
-    psd_dim::Cint,
-    n_psd::Cint
-) where {T}
+def mul_Wx_psd(y, x, Rx, rng_cones, workmat1, workmat2, workmat3, n_shift, n_psd, step_search):
+    X, Y, tmp = workmat1, workmat2, workmat3
 
-    Q = workmat1
-    q = workvec
+    svec_to_mat_gpu(X, x, rng_cones, n_shift, n_psd)
 
-    CUDA.@sync @. q = x[rng] + alpha*dx[rng]
-    svec_to_mat_no_shift_gpu!(Q, q, n_psd)
-    _, info = potrfBatched!(Q, 'L')
+    tmp = np.dot(Rx.T, X)
+    Y = np.dot(tmp, Rx)
 
+    if step_search:
+        mat_to_svec_no_shift_gpu(y, Y, n_psd)
+    else:
+        mat_to_svec_gpu(y, Y, rng_cones, n_shift, n_psd)
 
-    if all(==(0), info)
-        kernel = @cuda launch=false _kernel_logdet!(barrier, Q, psd_dim, n_psd)
-        config = launch_configuration(kernel.fun)
-        threads = min(n_psd, config.threads)
-        blocks = cld(n_psd, threads)
-    
-        CUDA.@sync kernel(barrier, Q, psd_dim, n_psd; threads, blocks)
+def mul_WTx_psd(y, x, Rx, rng_cones, workmat1, workmat2, workmat3, n_shift, n_psd, step_search):
+    X, Y, tmp = workmat1, workmat2, workmat3
 
-        return sum(@view barrier[1:n_psd])
-    else 
-        return typemax(T)
-    end
+    svec_to_mat_gpu(X, x, rng_cones, n_shift, n_psd)
 
-end
+    tmp = np.dot(X, Rx.T)
+    Y = np.dot(Rx, tmp)
 
-@inline function compute_barrier_psd(
-    barrier::AbstractVector{T},
-    z::AbstractVector{T},
-    s::AbstractVector{T},
-    dz::AbstractVector{T},
-    ds::AbstractVector{T},
-    α::T,
-    workmat1::AbstractArray{T,3},
-    workvec::AbstractVector{T},
-    rng_cones::AbstractVector,
-    psd_dim::Cint,
-    n_shift::Cint,
-    n_psd::Cint
-) where {T}
+    if step_search:
+        mat_to_svec_no_shift_gpu(y, Y, n_psd)
+    else:
+        mat_to_svec_gpu(y, Y, rng_cones, n_shift, n_psd)
 
-    CUDA.@allowscalar begin
-        rng = rng_cones[n_shift+1].start:rng_cones[n_shift+n_psd].stop
-    end
-
-    barrier_d = _logdet_barrier_psd(barrier, z, dz, α, workmat1, workvec, rng, psd_dim, n_psd)
-    barrier_p = _logdet_barrier_psd(barrier, s, ds, α, workmat1, workvec, rng, psd_dim, n_psd)
-    return (- barrier_d - barrier_p)
-
-end
-
-# ---------------------------------------------
-# operations supported by symmetric cones only 
-# ---------------------------------------------
-
-# implements y = Wx for the PSD cone
-@inline function mul_Wx_psd!(
-    y::AbstractVector{T},
-    x::AbstractVector{T},
-    Rx::AbstractArray{T,3},
-    rng_cones::AbstractVector,
-    workmat1::AbstractArray{T,3},
-    workmat2::AbstractArray{T,3},
-    workmat3::AbstractArray{T,3},
-    n_shift::Cint,
-    n_psd::Cint,
-    step_search::Bool
-) where {T}
-
-    (X,Y,tmp) = (workmat1,workmat2,workmat3)
-
-    svec_to_mat_gpu!(X,x,rng_cones,n_shift,n_psd)
-
-    #Y .= (R'*X*R)                #W*x
-    # mul!(tmp,Rx',X)
-    # mul!(Y,tmp,Rx)
-    CUDA.CUBLAS.gemm_strided_batched!('T', 'N', one(T), Rx, X, zero(T), tmp)
-    CUDA.CUBLAS.gemm_strided_batched!('N', 'N', one(T), tmp, Rx, zero(T), Y)
-
-    (step_search) ? mat_to_svec_no_shift_gpu!(y,Y,n_psd) : mat_to_svec_gpu!(y,Y,rng_cones,n_shift,n_psd)
-
-    return nothing
-end
-
-# implements y = WTx for the PSD cone
-@inline function mul_WTx_psd!(
-    y::AbstractVector{T},
-    x::AbstractVector{T},
-    Rx::AbstractArray{T,3},
-    rng_cones::AbstractVector,
-    workmat1::AbstractArray{T,3},
-    workmat2::AbstractArray{T,3},
-    workmat3::AbstractArray{T,3},
-    n_shift::Cint,
-    n_psd::Cint,
-    step_search::Bool
-) where {T}
-
-    (X,Y,tmp) = (workmat1,workmat2,workmat3)
-
-    svec_to_mat_gpu!(X,x,rng_cones,n_shift,n_psd)
-
-    #Y .= (R*X*R')                #W^T*x 
-    # mul!(tmp,X,Rx')
-    # mul!(Y,Rx,tmp)
-    CUDA.CUBLAS.gemm_strided_batched!('N', 'T', one(T), X, Rx, zero(T), tmp)
-    CUDA.CUBLAS.gemm_strided_batched!('N', 'N', one(T), Rx, tmp, zero(T), Y)
-
-    (step_search) ? mat_to_svec_no_shift_gpu!(y,Y,n_psd) : mat_to_svec_gpu!(y,Y,rng_cones,n_shift,n_psd)
-
-    return nothing
-end
-
-#-----------------------------------------
-# internal operations for SDP cones 
-# ----------------------------------------
-
-function step_length_psd_component_gpu(
-    workΔ::AbstractArray{T,3},
-    d::AbstractVector{T},
-    Λisqrt::AbstractMatrix{T},
-    n_psd::Cint,
-    αmax::T
-) where {T}
-    
-    # NB: this could be made faster since we only need to populate the upper triangle 
-    svec_to_mat_no_shift_gpu!(workΔ,d,n_psd)
-    lrscale_gpu!(workΔ,Λisqrt)
-    # symmetric_part_gpu!(workΔ)
-
-    # batched eigenvalue decomposition
-    e = CUDA.CUSOLVER.syevjBatched!('N','U',workΔ)
-
-    γ = minimum(e)
-    if γ < 0
-        return min(inv(-γ),αmax)
-    else
+@njit
+def step_length_psd_component(workΔ, d, Λisqrt, n_psd, αmax):
+    svec_to_mat_no_shift_gpu(workΔ, d, n_psd)
+    workΔ = np.dot(Λisqrt, workΔ)
+    e = np.linalg.eigvalsh(workΔ)
+    γ = np.min(e)
+    if γ < 0:
+        return min(1 / -γ, αmax)
+    else:
         return αmax
-    end
 
-end
+@njit
+def svec_to_mat(Z, z):
+    dim = Z.shape[0]
+    idx = 0
+    for j in range(dim):
+        for i in range(j + 1):
+            Z[i, j] = z[idx]
+            Z[j, i] = z[idx]
+            idx += 1
 
-#make a matrix view from a vectorized input
-function _kernel_svec_to_mat!(
-    Z::AbstractArray{T,3}, 
-    z::AbstractVector{T},
-    rng_blocks::AbstractVector,
-    n_shift::Cint,
-    n_psd::Cint
-) where {T}
-
-    i = (blockIdx().x-1)*blockDim().x+threadIdx().x
-
-    if i <= n_psd
+def svec_to_mat_gpu(Z, z, rng_blocks, n_shift, n_psd):
+    for i in range(n_psd):
         shift_i = i + n_shift
         rng_i = rng_blocks[shift_i]
-        @views Zi = Z[:,:,i]
-        @views zi = z[rng_i]
-        svec_to_mat!(Zi,zi)
-    end
+        Zi = Z[:, :, i]
+        zi = z[rng_i]
+        svec_to_mat(Zi, zi)
 
-    return nothing
-end
+def svec_to_mat_no_shift_gpu(Z, z, n_psd):
+    dim = Z.shape[0]
+    for i in range(n_psd):
+        Zi = Z[:, :, i]
+        rng_i = slice(i * (dim * (dim + 1)) // 2, (i + 1) * (dim * (dim + 1)) // 2)
+        zi = z[rng_i]
+        svec_to_mat(Zi, zi)
 
-@inline function svec_to_mat_gpu!(
-    Z::AbstractArray{T,3}, 
-    z::AbstractVector{T},
-    rng_blocks::AbstractVector,
-    n_shift::Cint,
-    n_psd::Cint
-) where {T}
-    kernel = @cuda launch=false _kernel_svec_to_mat!(Z,z,rng_blocks,n_shift,n_psd)
-    config = launch_configuration(kernel.fun)
-    threads = min(n_psd, config.threads)
-    blocks = cld(n_psd, threads)
+@njit
+def mat_to_svec(z, Z):
+    dim = Z.shape[0]
+    idx = 0
+    for j in range(dim):
+        for i in range(j + 1):
+            z[idx] = Z[i, j]
+            idx += 1
 
-    CUDA.@sync kernel(Z,z,rng_blocks,n_shift,n_psd; threads, blocks)
-end
-
-#No shift version of svec_to_mat
-function _kernel_svec_to_mat_no_shift!(
-    Z::AbstractArray{T,3}, 
-    z::AbstractVector{T},
-    n_psd::Cint
-) where {T}
-
-    i = (blockIdx().x-1)*blockDim().x+threadIdx().x
-
-    if i <= n_psd
-        @views Zi = Z[:,:,i]
-        dim = size(Zi,1)
-        rng_i = ((i-1)*triangular_number(dim) + 1):(i*triangular_number(dim))
-        @views zi = z[rng_i]
-        svec_to_mat!(Zi,zi)
-    end
-
-    return nothing
-end
-
-@inline function svec_to_mat_no_shift_gpu!(
-    Z::AbstractArray{T,3}, 
-    z::AbstractVector{T},
-    n_psd::Cint
-) where {T}
-    kernel = @cuda launch=false _kernel_svec_to_mat_no_shift!(Z,z,n_psd)
-    config = launch_configuration(kernel.fun)
-    threads = min(n_psd, config.threads)
-    blocks = cld(n_psd, threads)
-
-    CUDA.@sync kernel(Z,z,n_psd; threads, blocks)
-end
-
-#make a matrix view from a vectorized input
-function _kernel_mat_to_svec!(
-    z::AbstractVector{T},
-    Z::AbstractArray{T,3}, 
-    rng_blocks::AbstractVector,
-    n_shift::Cint,
-    n_psd::Cint
-) where {T}
-
-    i = (blockIdx().x-1)*blockDim().x+threadIdx().x
-
-    if i <= n_psd
+def mat_to_svec_gpu(z, Z, rng_blocks, n_shift, n_psd):
+    for i in range(n_psd):
         shift_i = i + n_shift
         rng_i = rng_blocks[shift_i]
-        @views Zi = Z[:,:,i]
-        @views zi = z[rng_i]
-        mat_to_svec!(zi,Zi)
-    end
+        Zi = Z[:, :, i]
+        zi = z[rng_i]
+        mat_to_svec(zi, Zi)
 
-    return nothing
-end
+def mat_to_svec_no_shift_gpu(z, Z, n_psd):
+    dim = Z.shape[0]
+    for i in range(n_psd):
+        Zi = Z[:, :, i]
+        rng_i = slice(i * (dim * (dim + 1)) // 2, (i + 1) * (dim * (dim + 1)) // 2)
+        zi = z[rng_i]
+        mat_to_svec(zi, Zi)
 
-@inline function mat_to_svec_gpu!(
-    z::AbstractVector{T},
-    Z::AbstractArray{T,3}, 
-    rng_blocks::AbstractVector,
-    n_shift::Cint,
-    n_psd::Cint
-) where {T}
-    kernel = @cuda launch=false _kernel_mat_to_svec!(z,Z,rng_blocks,n_shift,n_psd)
-    config = launch_configuration(kernel.fun)
-    threads = min(n_psd, config.threads)
-    blocks = cld(n_psd, threads)
+def skron_batched(out, A):
+    n = out.shape[2]
+    for i in range(n):
+        outi = out[:, :, i]
+        Ai = A[:, :, i]
+        skron_full(outi, Ai)
 
-    CUDA.@sync kernel(z,Z,rng_blocks,n_shift,n_psd; threads, blocks)
-end
+def skron_full(out, A):
+    sqrt2 = np.sqrt(2)
+    n = A.shape[0]
 
-#No shift version of mat_to_svec
-function _kernel_mat_to_svec_no_shift!(
-    z::AbstractVector{T},
-    Z::AbstractArray{T,3}, 
-    n_psd::Cint
-) where {T}
-
-    i = (blockIdx().x-1)*blockDim().x+threadIdx().x
-
-    if i <= n_psd
-        @views Zi = Z[:,:,i]
-        dim = size(Zi,1)
-        rng_i = ((i-1)*triangular_number(dim) + 1):(i*triangular_number(dim))
-        @views zi = z[rng_i]
-        mat_to_svec!(zi,Zi)
-    end
-
-    return nothing
-end
-
-@inline function mat_to_svec_no_shift_gpu!(
-    z::AbstractVector{T},
-    Z::AbstractArray{T,3}, 
-    n_psd::Cint
-) where {T}
-    kernel = @cuda launch=false _kernel_mat_to_svec_no_shift!(z,Z,n_psd)
-    config = launch_configuration(kernel.fun)
-    threads = min(n_psd, config.threads)
-    blocks = cld(n_psd, threads)
-
-    CUDA.@sync kernel(z,Z,n_psd; threads, blocks)
-end
-
-# produce the upper triangular part of the Symmetric Kronecker product of
-# a symmtric matrix A with itself, i.e. triu(A ⊗_s A) with full fill-in
-function skron_full!(
-    out::AbstractMatrix{T},
-    A::AbstractMatrix{T},
-) where {T}
-
-    sqrt2  = sqrt(2)
-    n      = size(A, 1)
-
-    col = 1
-    @inbounds for l in 1:n
-        @inbounds for k in 1:l
-            row = 1
+    col = 0
+    for l in range(n):
+        for k in range(l + 1):
+            row = 0
             kl_eq = k == l
 
-            @inbounds for j in 1:n
+            for j in range(n):
                 Ajl = A[j, l]
                 Ajk = A[j, k]
 
-                @inbounds for i in 1:j
-                    (row > col) && break
+                for i in range(j + 1):
+                    if row > col:
+                        break
                     ij_eq = i == j
 
-                    if (ij_eq, kl_eq) == (false, false)
+                    if not ij_eq and not kl_eq:
                         out[row, col] = A[i, k] * Ajl + A[i, l] * Ajk
-                    elseif (ij_eq, kl_eq) == (true, false) 
+                    elif ij_eq and not kl_eq:
                         out[row, col] = sqrt2 * Ajl * Ajk
-                    elseif (ij_eq, kl_eq) == (false, true)  
+                    elif not ij_eq and kl_eq:
                         out[row, col] = sqrt2 * A[i, l] * Ajk
-                    else (ij_eq,kl_eq) == (true, true)
+                    else:
                         out[row, col] = Ajl * Ajl
-                    end 
 
-                    #Also fill-in the lower triangular part
                     out[col, row] = out[row, col]
 
                     row += 1
-                end # i
-            end # j
             col += 1
-        end # k
-    end # l
-end
 
-function _kernel_skron!(
-    out::AbstractArray{T,3}, 
-    A::AbstractArray{T,3},
-    n::Clong
-) where {T}
-    i = (blockIdx().x-1)*blockDim().x+threadIdx().x
+def right_mul_batched(A, B, C):
+    n2 = A.shape[1]
+    n = n2 * A.shape[2]
+    for i in range(n):
+        k, j = divmod(i, n2)
+        val = B[j, k]
+        for l in range(A.shape[0]):
+            C[l, j, k] = val * A[l, j, k]
 
-    if i <= n
-        @views outi = out[:,:,i]
-        @views Ai = A[:,:,i]
-
-        skron_full!(outi,Ai)
-    end
-
-    return nothing
-end
-
-@inline function skron_batched!(
-    out::AbstractArray{T,3}, 
-    A::AbstractArray{T,3}
-) where {T}
-    n = size(out,3)
-
-    kernel = @cuda launch=false _kernel_skron!(out,A,n)
-    config = launch_configuration(kernel.fun)
-    threads = min(n, config.threads)
-    blocks = cld(n, threads)
-
-    CUDA.@sync kernel(out,A,n; threads, blocks)
-end
-
-#right multiplication for A[:,:,i] with the diagonal matrix of B[:,i]
-function _kernel_right_mul!(
-    A::AbstractArray{T,3}, 
-    B::AbstractArray{T,2},
-    C::AbstractArray{T,3},
-    n2::Cint,
-    n::Cint
-) where {T}
-    i = (blockIdx().x-1)*blockDim().x+threadIdx().x
-
-    if i <= n
-        (k,j) = divrem(i-1, n2)
-        j += 1
-        k += 1
-        val = B[j,k]
-        @inbounds for l in axes(A,1)
-            C[l,j,k] = val*A[l,j,k]
-        end
-    end
-
-    return nothing
-end
-
-@inline function right_mul_batched!(
-    A::AbstractArray{T,3}, 
-    B::AbstractArray{T,2},
-    C::AbstractArray{T,3}
-) where {T}
-    n2 = Cint(size(A,2))
-    n = n2*Cint(size(A,3))
-
-    kernel = @cuda launch=false _kernel_right_mul!(A,B,C,n2,n)
-    config = launch_configuration(kernel.fun)
-    threads = min(n, config.threads)
-    blocks = cld(n, threads)
-
-    CUDA.@sync kernel(A,B,C,n2,n; threads, blocks)
-end
-
-#left multiplication for B[:,:,i] with the diagonal matrix of A[:,i]
-function _kernel_left_mul!(
-    A::AbstractArray{T,2}, 
-    B::AbstractArray{T,3},
-    C::AbstractArray{T,3},
-    n2::Cint,
-    n::Cint
-) where {T}
-    i = (blockIdx().x-1)*blockDim().x+threadIdx().x
-
-    if i <= n
-        (k,j) = divrem(i-1, n2)
-        j += 1
-        k += 1
-        val = A[j,k]
-        @inbounds for l in axes(A,1)
-            C[j,l,k] = val*B[j,l,k]
-        end
-    end
-
-    return nothing
-end
-
-@inline function left_mul_batched!(
-    A::AbstractArray{T,2}, 
-    B::AbstractArray{T,3},
-    C::AbstractArray{T,3}
-) where {T}
-    n2 = Cint(size(B,2))
-    n = n2*Cint(size(B,3))
-
-    kernel = @cuda launch=false _kernel_left_mul!(A,B,C,n2,n)
-    config = launch_configuration(kernel.fun)
-    threads = min(n, config.threads)
-    blocks = cld(n, threads)
-
-    CUDA.@sync kernel(A,B,C,n2,n; threads, blocks)
-end
+def left_mul_batched(A, B, C):
+    n2 = B.shape[1]
+    n = n2 * B.shape[2]
+    for i in range(n):
+        k, j = divmod(i, n2)
+        val = A[j, k]
+        for l in range(A.shape[0]):
+            C[j, l, k] = val * B[j, l, k]
