@@ -41,6 +41,7 @@ Pardiso = "0.5.6,1"
 QDLDL = "0.4.1"
 SnoopPrecompile = "1"
 StaticArrays = "1"
+TOML = "1"
 TimerOutputs = "0.5"
 julia = "1.10"
 
