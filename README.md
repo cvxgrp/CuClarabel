@@ -44,7 +44,11 @@ The set $\mathcal{K}$ is a composition of convex cones; we support zero cones (l
 
 
 ## Installation
-- __CuClarabel.jl__ can be added via the Julia package manager (type `]`): `pkg> dev https://github.com/cvxgrp/CuClarabel.git`, (which will overwrite current use of Clarabel solver).
+The project has been merged back to the original repo of [__Clarabel.jl__](https://github.com/oxfordcontrol/Clarabel.jl) under the branch `CuClarabel`. The repo __CuClarabel.jl__ will no longer be updated. 
+
+Please go to `https://github.com/oxfordcontrol/Clarabel.jl/tree/CuClarabel` for the latest update of the GPU solver.
+
+
 
 ## Tutorial
 
