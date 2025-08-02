@@ -33,7 +33,7 @@ PardisoExt = "Pardiso"
 [compat]
 AMD = "0.4, 0.5"
 CUDSS = "0.5"
-DataStructures = "0.18"
+DataStructures = "0.18, 0.19"
 GenericLinearAlgebra = "0.3"
 HSL = "0.4, 0.5"
 JSON = "0.21"
