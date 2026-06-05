@@ -1,5 +1,5 @@
 
-#CuClarabel has moved!
+# CuClarabel has moved!
 
 please see the main Clarabel.jl repo: https://github.com/oxfordcontrol/Clarabel.jl/tree/CuClarabel
 
