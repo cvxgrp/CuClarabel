@@ -1,4 +1,9 @@
 
+#CuClarabel has moved!
+
+please see the main Clarabel.jl repo: https://github.com/oxfordcontrol/Clarabel.jl/tree/CuClarabel
+
+## Previous README
 <p align="center">
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/oxfordcontrol/ClarabelDocs/main/docs/src/assets/logo-banner-dark-jl.png">
